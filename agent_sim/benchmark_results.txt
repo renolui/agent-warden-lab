@@ -1,0 +1,5 @@
+Rounds: 5
+Iterations: 1000
+Baseline: 0.9580 ± 0.0540 s
+Warden-Hash: 1.1723 ± 0.1663 s, Overhead: +22.36%
+Warden-Local: 1.1628 ± 0.1559 s, Overhead: +21.37%

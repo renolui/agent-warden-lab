@@ -1,0 +1,1004 @@
+Agent-Warden: eBPF-Based Kernel-Native
+Process-File Provenance Tracking for LLM Agents
+Dongxu Cui1,2 , Zhichao Gu2 , Ping Zheng2 , Simeng Han2 , and Yong Liao1,*
+
+arXiv:2609.38245v1 [cs.CR] 29 Sep 2026
+
+1
+
+School of Cyber Science and Technology, University of Science and Technology of China, Hefei, China
+cdx@mail.ustc.edu.cn, yliao@ustc.edu.cn
+ORCID: 0009-0007-1008-5465 (D. Cui), 0000-0001-6403-0557 (Y. Liao)
+2
+China Greatwall Technology Group Co., Ltd., Shenzhen, China
+{guzhichao, zhengping, hansimeng}@greatwall.com.cn
+*
+Corresponding author: Yong Liao (yliao@ustc.edu.cn)
+
+Abstract—LLM agents execute dynamically generated process
+and file operations that are often invisible to application-layer
+tracing. We present Agent-Warden, an extended Berkeley Packet
+Filter (eBPF)-based provenance monitor for tracking task and
+regular-file states across process creation, file access, and process
+termination. Agent-Warden provides two interchangeable state
+backends: a PID-keyed hash-map backend for compatible kernels
+lacking BPF local-storage support and a task/inode-local-storage
+backend that couples state reclamation to kernel-object lifetimes.
+The system emits incremental causal edges to user space for
+asynchronous graph reconstruction and applies conservative exittriggered causal aggregation to preserve causal context for shortlived proxy tasks. In a controlled file-mediated propagation
+scenario, Agent-Warden reconstructed a cross-process causal
+chain that was absent from the application-layer trace. On
+x86-64 and ARM64 bare-metal hosts, the evaluated workloads
+showed 0.2–3.5% end-to-end overhead and 0.6–3.7% additional
+system CPU time. These results indicate that the prototype
+provides kernel-level visibility with the measured overheads in
+the evaluated settings.
+Index Terms—LLM Agents, eBPF, Lineage Tracking, System
+Security, Kernel Observability
+
+I. I NTRODUCTION
+Large Language Models (LLMs) with tool-calling capabilities enable agents to plan tasks, delegate subtasks, and invoke
+external tools [1]. This capability also expands the security
+impact of model-generated decisions. Indirect prompt injection
+can redirect tool-using applications [2], while recent studies
+have examined autonomous exploitation and agent-mediated
+attacks involving security-sensitive tool use [3]–[5]. When an
+agent is permitted to create processes or access files, a highlevel instruction can induce a sequence of low-level operatingsystem (OS) operations that may not be explicitly represented
+in the agent’s application-level execution record.
+Application-layer observability platforms such as Langfuse
+collect application-defined traces of model calls, tool invocations, and related execution spans [6]. Such telemetry is useful
+
+for analyzing application-level behavior, but its visibility is
+bounded by the events exposed through application instrumentation. Prior work on system-level agent observability similarly
+identifies cross-process execution as a reason to correlate application context with kernel events [7]. Dynamically created
+scripts, native system calls, and asynchronous child processes
+may therefore produce OS activity that is absent from an
+application-layer trace.
+At the kernel layer, process-associated state can be maintained in PID-keyed eBPF maps [8], [9]. This design requires
+explicit state reclamation and careful handling of PID reuse;
+shared-map access may also introduce synchronization overhead under concurrent workloads. These considerations motivate examining an object-lifetime-coupled alternative. More
+broadly, the visibility boundary of application instrumentation motivates an independent kernel-level observability substrate that associates process and inode state and reconstructs
+process–file causality outside application-controlled telemetry.
+To address this observability gap, we present Agent-Warden,
+an eBPF-based, kernel-native provenance tracing framework.
+To accommodate the heterogeneity of hardware compute capabilities and kernel versions in industrial deployments, AgentWarden introduces a dual-backend adaptive tracing architecture. The Warden-Hash engine uses a PID-keyed BPF hash
+map and provides expected constant-time lookup under typical
+workloads, supporting compatible kernels that lack BPF localstorage features. The Warden-Local engine uses BPF tasklocal storage to associate provenance state with the kernel’s
+task structure. This avoids repeated PID-keyed global map
+lookups on the common path and delegates state cleanup to
+the lifecycle management of the corresponding kernel object.
+We formalize the tracked provenance transitions using a
+four-rule state-transition model over the provenance graph
+G = (V, E). The model defines deterministic propagation for
+the process-derivation and file-interaction events considered
+
+This is the author’s version of a paper accepted for publication in the Proceedings of the 2026 IEEE International Conference on Trust, Privacy and Security
+in Intelligent Systems and Applications (IEEE TPS 2026).
+© 2026 IEEE. Personal use of this material is permitted. Permission from IEEE must be obtained for all other uses, in any current or future media, including
+reprinting/republishing this material for advertising or promotional purposes, creating new collective works, for resale or redistribution to servers or lists, or
+reuse of any copyrighted component of this work in other works.
+
+in this work. Building upon this model, we introduce exittriggered causal aggregation, which conservatively associates
+a parent process with the final provenance-influence state of
+a terminating child process. This mechanism preserves causal
+context for short-lived proxy tasks without claiming strict bytelevel data flow.
+The main contributions of this paper are summarized as
+follows:
+• Dual-Backend State Management: We design an eBPFbased provenance architecture featuring a PID-keyed hash
+backend for compatibility with kernels lacking BPF localstorage support and a task/inode-local-storage backend
+for kernel-object-coupled state management.
+• Process–File Propagation Semantics: We define and
+implement event-level causal propagation rules encompassing process derivation, regular-file operations, namespace alterations (rename), and conservative exit-triggered
+causal aggregation, effectively addressing the asynchronous execution patterns of agents.
+• Cross-Architecture Evaluation: We deploy and evaluate
+the prototype on x86-64 and ARM64 bare-metal systems,
+examining cross-temporal file-mediated propagation and
+the runtime overheads of both state backends under bursty
+workloads.
+II. BACKGROUND AND R ELATED W ORK
+A. eBPF Execution and Security Model
+The eBPF architecture defines a virtual-machine instruction
+set and an event-driven execution environment within the
+Linux kernel [8]–[10]. An eBPF program is attached to a
+supported kernel hook, such as a tracepoint, an fentry/fexit
+site, or a Linux Security Module (LSM) hook, and is invoked
+when the corresponding event occurs. Before a program is
+loaded, the kernel verifier analyzes it and rejects programs for
+which it cannot establish properties such as bounded control
+flow, valid memory accesses, and type-safe use of kernel
+helpers. Programs accepted by the verifier can be interpreted or
+compiled by a just-in-time compiler into native instructions.
+Program loading and attachment are additionally subject to
+kernel privilege and authorization controls.
+eBPF maps provide persistent state across event invocations,
+while task and inode local-storage maps associate state with
+the lifetime of the corresponding kernel object. Ring buffers
+support asynchronous delivery of event records from kernel
+space to user space. Agent-Warden uses these mechanisms to
+update provenance state at kernel hooks and to deliver causal
+edges for user-space graph reconstruction. These mechanisms
+constrain the behavior of loaded monitoring programs but do
+not establish an absolute security boundary. Consistent with
+our threat model, we assume that the Linux kernel, the eBPF
+verifier and runtime, and the privileged component that loads
+Agent-Warden remain trusted.
+B. LLM Agent Security and Application-Layer Observability
+Tool-using LLM agents can initiate security-sensitive system actions [1]. Prior studies have demonstrated indirect
+
+prompt-injection and agent-mediated attack scenarios in which
+unintended instructions lead to system effects [2]–[5]. The
+OWASP Foundation also identifies excessive agency as a
+relevant risk for agentic applications [11]. Existing mechanisms include declarative sandbox policies in AgentBound
+[12], application-layer tool-invocation rules in AgentSpec
+[13], and application-level trace observability in Langfuse [6].
+These mechanisms have different enforcement and observation
+boundaries. Application-layer trace platforms observe events
+exposed by participating components, whereas permission and
+sandbox mechanisms enforce policies within their configured scope. Operations performed by dynamically generated
+scripts, native binaries, or uninstrumented child processes may
+therefore be absent from the application trace. Kernel-level
+observation provides a complementary source of process and
+file events outside this instrumentation boundary.
+C. System-Level Provenance Tracking and Bottlenecks of Traditional Auditing
+System-level provenance systems construct event-causality
+graphs from operating-system activity. Early approaches relied primarily on audit subsystems such as Linux Auditd.
+Although these methods can capture process-level information
+flows, systems such as ProTracer identify context switching
+and kernel-to-user-space data transfer as relevant sources of
+overhead [14], [15]. At high event rates, these costs can affect
+collection throughput. EAudit and TAPAS address event loss
+and online-analysis overhead through buffering and graph partitioning, respectively [16]–[18]; however, event-capture and
+analysis costs remain design considerations for low-latency
+provenance monitoring [19].
+D. eBPF-Based Agent Observability and Comparison with
+AgentSight
+AgentSight [7] introduces boundary tracing to correlate an
+agent’s high-level intent with its system-level effects. It uses
+eBPF probes to observe decrypted LLM communications and
+kernel events, and its user-space engine combines process
+lineage, temporal proximity, and argument matching before
+applying secondary LLM-based semantic analysis. Its primary
+objective is therefore to bridge the semantic gap between LLM
+interactions and system actions.
+Agent-Warden addresses a narrower and complementary
+question: how process–file provenance state can be propagated and maintained when a causal path passes through a
+persistent file and may later continue in a process outside the
+originating process tree. It does not recover LLM intent or perform semantic threat interpretation. Instead, it defines explicit
+transitions for successful process and regular-file events, including process derivation, process-to-file propagation, file-toprocess propagation, rename-associated namespace changes,
+and conservative exit-triggered aggregation. It also examines
+two kernel-state backends, including task/inode-local storage
+that couples provenance-state reclamation to kernel-object
+lifetimes.
+
+TABLE I
+M ECHANISM - LEVEL COMPARISON BETWEEN AGENT S IGHT AND AGENT-WARDEN . “N OT SPECIFIED ” INDICATES THAT THE CITED AGENT S IGHT PAPER
+DOES NOT DESCRIBE THE CORRESPONDING MECHANISM AS PART OF ITS DESIGN ; IT DOES NOT IMPLY THAT SUCH A MECHANISM CANNOT BE ADDED .
+Dimension
+Primary objective
+
+AgentSight [7]
+Correlate LLM-level intent with system-level effects.
+
+Observed evidence
+
+Decrypted LLM traffic, process and system-call events, file
+activity, and network activity.
+Multi-signal correlation using process lineage, temporal
+proximity, argument matching, and secondary LLM analysis.
+File events are included in correlated agent traces; explicit
+propagation from a written file to a later independent reader
+is not specified.
+Uses in-kernel filtering and a user-space stateful process
+tree; object-lifetime-coupled provenance storage is not a
+stated design objective.
+Includes LLM intent and semantic interpretation of correlated traces.
+
+Causal mechanism
+
+File-mediated propagation
+
+Kernel-state lifecycle
+
+Semantic scope
+
+Table I formalizes these distinctions. The comparison indicates that the contribution of Agent-Warden is not the use of
+eBPF itself, but the explicit process–file propagation semantics
+and the associated kernel-state-lifetime design.
+III. S YSTEM M ODEL
+To delineate the scope of the agent observability framework,
+this section defines the system assumptions and analyzes the
+evasion threats faced by current monitoring mechanisms.
+A. System Assumptions and Scenarios
+This work focuses on the autonomous execution of LLM
+agents on host machines, including both x86-64 and ARM64
+physical nodes. From a security standpoint, we assume that
+the underlying Linux kernel (including the eBPF subsystem)
+and hardware are initially trusted [10], [20], and that the
+adversary or a compromised agent has not yet gained kernellevel privileges. The application-layer agent framework is
+considered an untrusted domain; it may issue malicious lowlevel system calls due to prompt injection, hallucinations, or
+unintended behaviors of the framework itself (e.g., unauthorized side-channel probing, covert data exfiltration). Under
+these assumptions, the goal of the framework is to observe
+agent-associated process-lifecycle and regular-file interactions
+within the explicitly defined monitoring scope.
+B. Threat Model and Observability Blind Spots
+Unlike traditional binary exploitation, security threats in
+agent environments primarily manifest as attempts to evade the
+observability system itself. Current observability approaches,
+which heavily rely on application-layer logs (e.g., planning
+outputs, API call monitoring), face two critical blind spots
+when confronted with black-box low-level execution:
+• A compromised agent can spawn and execute temporary
+scripts (e.g., stealthy data theft or state probing payloads)
+on a millisecond timescale, attempting to complete operations and destroy the process before application-layer
+monitoring components can poll or read the state, thereby
+evading detection in macroscopic system logs.
+
+Agent-Warden
+Maintain kernel-level process–file provenance across synchronous and asynchronous execution.
+Successful process-lifecycle events, regular-file reads and
+writes, and rename-associated namespace changes.
+Four explicit event-level propagation rules without LLM-based
+inference.
+Successful writes propagate process state to an inode, and
+successful reads propagate inode state to the reading process.
+Provides a PID-keyed hash backend and a task/inode-localstorage backend coupled to kernel-object lifetimes.
+Intentionally limited to conservative OS-level causal association without inferring prompt intent.
+
+Malicious payloads may cause the agent to create a
+child process group detached from the current terminal
+session to perform covert tasks. Once the critical operation is dispatched, the intermediate proxy process exits
+immediately, thus severing the application-layer context
+between parent and child processes and preventing the
+observability system from tracing backwards.
+To address the above blind spots, the proposed dualbackend architecture aims to achieve three core observability
+goals: fine-grained lineage tracing, causal alignment across
+asynchronous execution cycles, and scope-bounded capture of
+process-lifecycle and regular-file events.
+•
+
+IV. M ETHODOLOGY
+A. Dual-Backend Adaptive Observability Architecture
+This section describes the design and implementation of the
+Agent-Warden provenance tracing framework. Considering the
+heterogeneity of hardware capabilities and kernel versions in
+real-world deployments, Agent-Warden adopts a dual-backend
+adaptive architecture for underlying state maintenance, namely
+the Warden-Hash engine and the Warden-Local engine. The
+design aims to offer a pragmatic engineering trade-off between
+backward compatibility and kernel-object-coupled state management.
+The Warden-Hash engine uses eBPF hash maps to maintain
+provenance state for system entities. These maps use mature
+kernel mechanisms, including Read-Copy-Update (RCU) [21],
+and provide average-case hash-table lookup. This backend is
+available on kernels that do not support BPF local storage.
+Under high task-creation rates or growth in retained state, the
+shared global map may still incur hash collisions and crosscore synchronization costs.
+To provide kernel-object-coupled state management and
+per-object state separation, this work further introduces the
+Warden-Local engine. This engine uses BPF task-local storage
+to associate the required provenance marker with the kernel’s
+task_struct object. This binding isolates state across
+thread groups while allowing all threads within the same TGID
+
+to access a shared canonical provenance marker, avoiding
+repeated PID-keyed global map lookups on the common
+access path. More importantly, Warden-Local couples the
+lifecycle of the provenance state to that of the corresponding
+kernel object. When a transient task terminates, the kernel
+reclaims the object-associated state, so the probes do not
+require a separate deletion path for the corresponding tasklocal entry. Furthermore, to maintain unified kernel-objectcoupled state management across all system entities, this localstorage paradigm is symmetrically applied to file operations
+via BPF_MAP_TYPE_INODE_STORAGE, ensuring that file
+provenance markers remain associated with the corresponding
+inode for the lifetime of that inode object.
+B. Causal Flow Transition Model Based on Boolean Matrix
+Algebra
+From the perspective of kernel interaction, any program’s
+modification of system state can ultimately be reduced to
+ordered read and write operations on generalized files (i.e.,
+state carriers). As illustrated in Figure 1, regardless of whether
+a program manifests as 3D graphics rendering, neural network
+training, financial transaction processing, or autonomous agent
+execution, its interaction with the kernel can be decomposed
+into a finite combination of the following six atomic operations:
+• exec: replaces the current process image and creates a
+new process-version node in the provenance graph.
+• fork: duplicates the computational context to extend parallelism.
+• exit: terminates computation and returns results.
+• read: retrieves data from persistent state.
+• write: modifies persistent state.
+• rename: updates the namespace mapping while preserving any provenance marker associated with the underlying
+inode, rather than introducing a new content-flow transition.
+To eliminate false causal edges generated by denied or
+failed operations, Agent-Warden uses return-side hooks, such
+as kretprobes or fexit programs, to validate the success and
+transferred byte count of file operations. Process-lifecycle
+transitions are captured through dedicated kernel events, such
+as sched_process_fork, sched_process_exec, and
+sched_process_exit. State updates are performed only
+after the corresponding operation is known to have succeeded
+(e.g., ret > 0 for byte transfers in read/write, ret == 0 for
+rename).
+Based on this, Agent-Warden intercepts the aforementioned
+kernel atomic operations via eBPF hooks to achieve lowlevel provenance tracking. To formally describe the multidimensional provenance propagation mechanism within the
+framework, we define a four-rule state-transition model. Processes and files in the system are abstracted as graph nodes,
+and system calls are abstracted as directed edges. Inspired by
+established information-flow tracking principles [22], AgentWarden defines the following four provenance propagation
+rules:
+
+Human Intention
+
+exit
+
+rename
+
+fork
+
+write
+
+exec
+
+read
+
+Agent
+
+Abstraction Toolchain
+User Space
+
+System
+Call
+
+Generalized File
+State Change
+
+Kernel Space
+
+Fig. 1. The six atomic operations and the system call layer.
+
+Process Derivation (P → P ): On fork or clone, the child
+inherits the provenance state of its parent. On exec, the current
+task retains its provenance state while the system records a version edge from the pre-exec process image to the newly loaded
+image. These rules keep agent-created tasks and programimage transitions within the same provenance lineage. This
+ensures that all subtasks spawned by an agent are included in
+the provenance graph. To maintain process-wide provenance
+consistency across threads, our model enforces state consistency at the Thread Group ID (TGID) level. Architecturally,
+rather than maintaining isolated states per thread, AgentWarden resolves the thread-group leader for each event and
+uses the leader’s task-local storage as the canonical processlevel state. Consequently, all threads in the same TGID access
+the same monotonic provenance marker. This avoids explicit
+replication of state across individual thread-local entries.
+Entity Propagation (P → F ): When a tracked process
+successfully writes data to a regular file, the process’s provenance marker is propagated to the corresponding inode. A
+successful rename operation does not introduce a new contentflow transition; it is recorded as a namespace edge while
+preserving any marker already associated with the underlying
+inode.
+Read-Based Propagation (F → P ): When an unmarked
+process successfully reads data from a provenance-marked file,
+the file’s provenance marker is propagated along the read edge
+to the process. This preserves the causal association when a
+previously unrelated process consumes data produced within
+the monitored agent lineage.
+Exit-Triggered Causal Aggregation (P → P ): Upon termination of a controlled child process, Agent-Warden records
+a conservative child-to-parent causal-association edge and updates the parent’s provenance-influence state. This transition
+does not imply strict byte-level data flow. Instead, it intentionally over-approximates causal linkage so that short-lived proxy
+tasks remain associated with the agent’s broader execution
+lineage.
+To express the four-rule state-transition model in Boolean
+algebra, we define a causal flow transition model based on
+Boolean matrix algebra.
+
+Let the global set of system entities be V = P ∪ F , where
+P is the set of processes and F the set of files. At logical time
+t, the row vector τ (t) ∈ B|V | (where B = {0, 1}) represents
+the conservative provenance-influence state of system entities.
+(t)
+A marked entity (i.e., τi = 1) is causally associated with
+the monitored agent lineage; this association may arise from
+observed data transfer or conservative exit-time aggregation
+and therefore does not necessarily imply byte-level data dependence.
+For any discrete, atomic low-level system event et =
+⟨op, u, v⟩ occurring at logical time t (where u represents the
+active subject/initiator and v represents the passive target), a
+causal flow projection matrix C (t) ∈ B|V |×|V | is defined to
+map the operational semantics to a directed edge in the macrolevel graph structure. Its formal definition is as follows:
+C (t) = (If ork (et ) + Iexec (et ) + Iwrite (et ) + Iexit (et ))Mu,v
++ Iread (et )Mv,u
+
+(1)
+
+where Iop (et ) is the event type indicator function, which
+takes the value 1 if and only if the operation type of et is op,
+and Mi,j is a basis matrix with a 1 at position (i, j) and 0
+elsewhere. For a read event, the causal edge is oriented from
+the file object v to the process u because data flows from the
+passive object v to the active subject u; therefore, the read
+term uses Mv,u . Conversely, a write event is oriented from
+u to v. Note that the rename operation is omitted from C (t)
+because it emits a namespace-change edge without modifying
+the provenance-influence state τ (t) .
+To initialize the system, all designated agent roots are
+(0)
+explicitly tracked, i.e., τr = 1 for r ∈ A, where A is
+the set of monitored agent roots. Based on the projection
+matrix, the state transition of the global provenance graph
+is accomplished through deterministic Boolean vector algebra
+operations without the need for traversal or complex logical
+judgment. The unified state transition evolution equation takes
+the following simplified form:
+
+
+τ (t+1) = τ (t) ∨ τ (t) ⊗ C (t)
+(2)
+
+provenance-propagation and namespace-change events, the
+framework asynchronously emits an incremental causal edge
+to user space via an eBPF ring buffer. This design decouples
+graph reconstruction from the system-call path and avoids
+synchronous user-space I/O during event processing.
+D. Architectural Sources of Runtime Overhead
+Table II decomposes the runtime work introduced by AgentWarden. The synchronous kernel path includes eBPF hook dispatch and program execution, event qualification, provenancestate access and update, and ring-buffer submission for emitted
+edges. User-space graph reconstruction is asynchronous with
+respect to the triggering system call but still contributes to
+aggregate system CPU consumption. State reclamation differs between the two backends: Warden-Hash performs explicit map-state maintenance, whereas Warden-Local delegates
+reclamation of local-storage entries to the lifetime of the
+associated kernel objects.
+A static eBPF instruction count alone would not account
+for the runtime costs of map and local-storage helper calls,
+object allocation, synchronization, or ring-buffer delivery. We
+therefore use the architectural breakdown below to identify the
+relevant cost centers, while reporting only aggregate end-toend and system CPU measurements in the evaluation.
+TABLE II
+A RCHITECTURAL S OURCES OF AGENT-WARDEN RUNTIME OVERHEAD
+
+where ⊗ denotes Boolean matrix multiplication, and ∨
+denotes the element-wise OR operation on vectors.
+
+Introduced work
+Backend dependence
+Dispatch and execute the attached eBPF Shared by both backprogram for each candidate event.
+ends.
+Event qualification Identify the involved entities and vali- Shared by both backdate operation success and transferred ends.
+byte count.
+State access and Retrieve provenance markers and ap- Hash-map
+helpers
+update
+ply the corresponding scalar propaga- for
+Warden-Hash;
+tion rule.
+task/inode-localstorage helpers for
+Warden-Local.
+Edge emission
+Reserve, populate, and submit a ring- Shared by both backbuffer record for each emitted causal or ends.
+namespace edge.
+State reclamation Remove or reclaim provenance state Explicit map mainwhen the corresponding entity termi- tenance for Wardennates.
+Hash; kernel-objectlifetime reclamation
+for Warden-Local.
+Graph reconstruc- Consume emitted records and update Shared
+and
+tion
+the provenance graph in user space.
+asynchronous.
+
+C. Architectural Implementation and Asynchronous Reconstruction
+
+V. E XPERIMENT
+
+Equations (1) and (2) formally specify the causal semantics
+of low-level events, rather than mandating an implementation
+based on dense matrix operations. In our system architecture,
+constructing the global provenance graph does not rely on
+computing high-dimensional matrices. Instead, each observed
+kernel event is directly reduced to an expected constant-time
+state update on its specific source and destination entities via
+the eBPF mechanism.
+To reconstruct the global provenance graph without stalling
+kernel execution, Agent-Warden adopts an “in-kernel local scalar update, user-space asynchronous reconstruction”
+paradigm. For each relevant successful event, including
+
+Stage
+Hook execution
+
+Our evaluation addresses two research questions. RQ1 asks
+whether Agent-Warden can reconstruct a file-mediated causal
+chain that crosses the boundary of application instrumentation.
+RQ2 examines the runtime overhead and cross-architecture
+behavior of the two kernel-state backends. RQ1 uses Langfuse
+as an application-layer functional visibility baseline under the
+same workload, whereas RQ2 compares each Agent-Warden
+backend with an uninstrumented execution.
+A. Experimental Setup and Workloads
+To evaluate the functionality and performance overhead of
+the Agent-Warden framework and its dual-backend provenance
+
+engines in heterogeneous hardware environments, we conduct
+experiments on two bare-metal deployment scenarios to exclude interference from virtualization:
+• x86-64 General-Purpose Node: Equipped with an AMD
+9950X processor (16 cores, 32 threads).
+• ARM64 Edge Computing Node: Equipped with a
+Phytium FT-D2000/4 processor (8 cores, 8 threads), used
+to evaluate cross-ISA portability.
+All test nodes run Ubuntu 24.04 LTS with Linux kernel 6.8.
+This kernel provides native support for features such as BPF
+Type Format (BTF) and BPF task-local storage. Monitoring
+probes are developed using Clang 18 and libbpf, and are
+implemented with BTF and CO-RE to facilitate portability
+across compatible kernel versions. Although the Warden-Hash
+engine is architecturally designed to provide backward compatibility for kernels lacking modern local storage features,
+our evaluation standardizes on Linux kernel 6.8 to provide a
+consistent basis for comparing the two state backends.
+We use Langfuse as an application-layer functional visibility baseline rather than as a like-for-like performance
+baseline. Langfuse records traces emitted by instrumented
+application components and supports distributed tracing when
+participating components explicitly propagate a shared trace
+context [23], [24]. However, instrumenting the parent agent
+does not automatically instrument arbitrary child processes,
+dynamically generated scripts, or native binaries. Trace context
+is also not automatically propagated through a regular file to
+an independent process that later reads the file. Instrumenting
+every participating component would modify the evaluated
+workload and would not provide the same kernel-event stream
+of successful process, read, write, and rename operations.
+We therefore compare Langfuse and Agent-Warden in terms
+of the causal structures visible under the same unmodified
+workload, rather than comparing their runtime overheads as if
+they implemented an equivalent event scope.
+At the kernel layer, generic eBPF security monitors such as
+Falco and Tetragon have different monitoring and enforcement
+objectives and do not implement the process–file propagation
+semantics evaluated here. A quantitative comparison would
+therefore combine different event scopes and security models.
+For RQ2, we measure Warden-Hash and Warden-Local against
+uninstrumented execution under identical workloads to characterize their respective runtime overheads.
+B. Causal Tracking Effectiveness and Cross-Boundary Provenance
+To examine the causal tracking capability of the framework
+in a controlled cross-boundary scenario, we use a predefined
+payload that generates the expected process–file propagation
+chain. We provide the agent with a predefined adversarial test
+task involving cross-boundary interactions, which produces the
+expected core causal subgraph shown in Figure 2 under AgentWarden’s conservative propagation semantics.
+In this adversarial scenario, the agent process (PID
+1001) spawns the task script agent_task.sh (PID
+1002), which writes the provenance-marked temporary file
+
+Process
+
+Tracked Process
+PID:1001(Agent)
+Provenance-Marked File
+
+PID:1002(agent_task.sh)
+
+Write File
+
+intermediate_config.tmp
+
+Rename
+target_cpuinfo
+
+Read-Based Provenance
+Propagation
+
+PID:1003(mv)
+
+Read File
+
+Exit-Triggered Causal
+Aggregation
+
+PID:1004(cat)
+
+Write File
+monitor.log
+
+PID:1005(file_monitor.sh)
+
+Fig. 2. Core causal subgraph of the file-mediated workload. PID 1003 records
+the rename from intermediate_config.tmp to target_cpuinfo;
+the operation preserves the inode-associated provenance marker.
+
+intermediate_config.tmp. The task script then invokes mv (PID 1003), which successfully renames this file
+to target_cpuinfo. Agent-Warden records this operation
+as a namespace-change edge while preserving the provenance
+marker associated with the underlying inode; the rename does
+not introduce an additional content-flow transition. Subsequently, the independently running and uninstrumented host
+script file_monitor.sh (PID 1005) spawns cat (PID
+1004), which reads the renamed file.
+Under the same workload, Langfuse records the events
+emitted within the instrumented agent application but does not
+contain the subsequent operations of the uninstrumented host
+process. After the generated task script writes and renames
+the temporary file, no application-level trace context is carried
+through the renamed file to the independent monitor process.
+Consequently, the Langfuse trace does not reconstruct the
+file-to-process causal continuation or associate the later write
+to monitor.log with the originating agent trace. This
+result reflects the boundary of the selected application instrumentation rather than an inability of Langfuse to correlate
+components that explicitly propagate a shared trace context.
+Compared with the application-layer trace, Agent-Warden
+records the causal structures defined by its four-rule statetransition model. As shown in the tracing topology in Figure 2,
+
+Evolution of Process Lifespan During Agent Execution
+
+TABLE III
+F UNCTIONAL V ISIBILITY UNDER THE F ILE -M EDIATED W ORKLOAD
+Process Lifespan (Log Scale)
+
+Root Agent Process
+
+Observed information
+Langfuse
+Agent-Warden
+Instrumented application-level execution
+Yes
+Out of scope
+OS process derivation events
+Not recorded
+Recorded
+Successful regular-file read/write/rename
+Not recorded
+Recorded
+events
+Causal continuation through a file to an Not reconstructed Reconstructed
+independent reader
+Prompt and model-call semantics
+Recorded
+Out of scope
+
+10000 ms
+
+1000 ms
+
+100 ms
+
+10 ms
+
+1 ms
+
+the system records process derivation (P → P ) and entity
+propagation (P → F ), and applies read-based propagation
+(F → P ) when an independent process reads the provenancemarked file. Moreover, upon the termination of this child
+process, the exit-triggered causal aggregation conservatively
+associates the parent process with the child’s final provenanceinfluence state.
+The reconstructed subgraph contains the expected crossboundary causal chain defined by the propagation rules.
+To assess repeatability beyond a single successful trace, we
+executed the end-to-end workload 30 times for each state backend on both the x86-64 and ARM64 platforms. After each run,
+we manually inspected the reconstructed provenance graph
+to verify the expected process-derivation behavior, processto-file propagation, rename-edge recording with inode-marker
+preservation, file-to-process propagation, exit-triggered causal
+aggregation, and complete causal-chain reconstruction. As
+shown in Table IV, both backends reproduced all expected
+behaviors in all 30 runs on each platform.
+TABLE IV
+R EPEATABILITY OF E XPECTED P ROPAGATION B EHAVIORS ON X 86-64
+AND ARM64 P LATFORMS (30 RUNS PER BACKEND PER P LATFORM )
+Behavior
+Warden-Hash Warden-Local
+Process derivation and exec continuity
+30/30
+30/30
+Process-to-file propagation
+30/30
+30/30
+Rename edge and marker preservation
+30/30
+30/30
+File-to-process propagation
+30/30
+30/30
+Exit-triggered causal aggregation
+30/30
+30/30
+Complete causal-chain reconstruction
+30/30
+30/30
+
+Figure 3 illustrates the cross-temporal behavior observed in
+the evaluated workload. The scatter plot shows the temporal
+distribution and diverse lifespans of proxy tasks, motivating
+cross-temporal, object-lifetime-coupled tracking. Near the end
+of the time axis (around t = 77, 000 ms), the system records a
+trajectory point that is temporally separated from the main task
+flow. This event corresponds to an independent asynchronous
+polling service on the host. Tens of thousands of milliseconds
+after the agent’s core task flow had terminated, this polling
+process attempted to read an intermediate configuration file
+carrying the agent-associated provenance marker. Applicationcontext-bound tracing may lose this association once the
+original agent execution context terminates. However, AgentWarden successfully retained the causal markers on the corresponding inode object, capturing this asynchronous causal
+association.
+Because provenance state is maintained at the kernel layer
+
+0
+
+10000
+
+20000
+
+30000
+
+40000
+
+50000
+
+60000
+
+70000
+
+80000
+
+Timeline: Process Birth Time from Task Start (ms)
+
+Fig. 3. Temporal distribution and diverse lifespans of proxy tasks spawned by
+the LLM agent workload. This asynchronous execution pattern illustrates the
+need for object-lifetime-coupled provenance tracking through file-mediated
+causality.
+
+and coupled to the inode lifetime, Agent-Warden associated
+the delayed read with the earlier agent-generated file state even
+after the original application-layer context had terminated.
+This result demonstrates cross-temporal tracking within the
+lifetime of the corresponding in-memory inode object.
+C. Stress Testing under Bursty Workloads
+To quantify the runtime overhead of Agent-Warden under
+a bursty process-and-file workload, we construct a synthetic
+“agent behavior primitive cycle.” The workload repeats a
+sequence of process creation (fork/exec), command invocation,
+file read/write, and rename operations 1,000 times to generate
+a bursty kernel-event workload resembling an agent task.
+Three control baselines are established: a native system
+without probes (Baseline Off), the Agent-Warden hash-mapbased tracking engine (Warden-Hash), and the Agent-Warden
+local-storage-based tracking engine (Warden-Local). The experiments are conducted separately on physical x86-64 and
+ARM64 nodes.
+Across the evaluated workloads, the measured end-to-end
+overhead was 0.2–3.5%, and the additional system CPU time
+was 0.6–3.7%. Table V summarizes these measurements relative to the baseline system across both platforms (mean ±
+standard deviation over 90 measurement rounds).
+TABLE V
+P ERFORMANCE OVERHEAD OF AGENT-WARDEN R ELATIVE TO BASELINE
+( MEAN ± STD , n = 90 ROUNDS )
+Platform
+x86-64
+ARM64
+
+Engine
+Warden-Hash
+Warden-Local
+Warden-Hash
+Warden-Local
+
+End-to-End (%)
+0.2 ± 1.2
+1.1 ± 1.4
+3.5 ± 0.4
+3.5 ± 0.4
+
+System CPU ∆ (%)
+0.6 ± 3.1
+2.5 ± 3.3
+3.7 ± 0.8
+3.7 ± 0.8
+
+The larger relative variance observed on x86-64 may partly
+reflect its smaller absolute baseline latency (1.57 s versus 8.30 s
+on ARM64), because a similar absolute timing fluctuation
+produces a larger percentage change when the baseline is
+shorter.
+
+The reported end-to-end and system CPU measurements
+aggregate the cost centers summarized in Table II. Both
+backends incur hook-dispatch, event-qualification, scalar stateupdate, ring-buffer, and asynchronous reconstruction costs.
+Their backend-specific difference lies primarily in state access
+and reclamation: Warden-Hash uses key construction and
+hash-map helper operations together with explicit state maintenance, whereas Warden-Local uses task/inode-local-storage
+helpers and kernel-object-coupled reclamation. Local storage
+therefore changes the state-management path but does not
+imply lower aggregate CPU consumption for every workload.
+Under the evaluated x86-64 workload, Warden-Local has a
+higher measured system CPU delta than Warden-Hash, while
+the two backends have the same rounded overhead values on
+ARM64. Because the current measurements do not isolate
+individual stages, these differences cannot be attributed to
+a single helper, map operation, or event type. The results
+support only the aggregate conclusion that both backends
+have comparable end-to-end overhead within the evaluated
+workloads. Warden-Hash provides compatibility with kernels
+lacking local storage, whereas Warden-Local provides objectlifetime-coupled state management.
+VI. D ISCUSSION
+a) Interpretation of Experimental Results: Within the
+evaluated workloads, both Agent-Warden backends reproduced
+the expected four-rule process and file propagation behavior.
+Notably, exit-triggered causal aggregation preserves a conservative causal association between short-lived child processes
+and their parent context beyond the application-layer trace
+boundary. Warden-Local uses task/inode-local storage and
+reduces reliance on PID-keyed global maps, whereas WardenHash supports kernels that lack BPF local-storage features.
+Because the measurements aggregate multiple cost centers, the
+observed overhead differences cannot be attributed to a single
+state-access mechanism.
+b) Comparative Analysis with Existing Work: As summarized in Table I, AgentSight and Agent-Warden both use
+eBPF for system-level observation but address different causal
+questions. AgentSight correlates LLM communications with
+system effects and applies semantic analysis, whereas AgentWarden does not infer high-level intent. Agent-Warden instead
+focuses on explicit process–file state propagation, including
+the continuation of provenance through a persistent file to
+a later reader, and on kernel-object-coupled provenance-state
+management. The two systems should therefore be viewed
+as complementary rather than as interchangeable implementations of the same observability model.
+Langfuse is used only as an application-layer visibility reference rather than as a performance baseline. Runtime overhead
+is evaluated by comparing Warden-Hash and Warden-Local
+with the uninstrumented system under identical workloads.
+Functional behavior is examined against a predefined expected
+subgraph generated by the controlled payload.
+c) Limitations: Within the evaluated process–file workloads, the prototype reproduced the expected causal structures
+
+with the measured overheads; its current scope has the following limitations:
+Observability Scope and Granularity: The current state-transition model primarily captures macrolevel process lifecycles and standard file I/O operations. Advanced kernel interactions (e.g., asynchronous
+io_uring events, memory-mapped I/O) and covert
+side-channel communications (e.g., timing characteristics
+via nanosleep) remain invisible. Extending observability to these granular events is targeted for future
+architectural iterations.
+• Causal Precision and Semantic Gap: The framework
+constructs physical flow topology at the system call level,
+lacking the semantic context of application-layer prompts.
+Furthermore, the conservative exit-triggered aggregation
+explicitly prioritizes causal linkage over strict data dependence, which may introduce causal over-approximation
+(false positives) if a parent process does not explicitly
+consume the proxy child’s output. Additionally, process
+reparenting may cause exit-time aggregation to occasionally refer to a subreaper (e.g., systemd) rather than the
+original spawning process, a boundary case designated
+for future refinement.
+• State Persistence Volatility: To maintain expected
+constant-time in-memory state access, inode-local labels
+are currently coupled to the lifetime of in-memory inode
+objects. They are not persistent across severe memory
+pressure (inode cache reclamation) or system reboots.
+Non-volatile tracking could be implemented using filesystem extended attributes or an external persistent store, at
+the cost of additional metadata-management and persistence overhead; this extension is left to future work.
+•
+
+d) Future Work: To address the above limitations, future
+work will proceed along the following directions:
+1) Cross-layer semantic alignment and end-to-end attribution: Explore a joint observability architecture
+that correlates the kernel-level provenance graph with
+application-layer processing logs along temporal and
+entity-level dimensions, in order to bridge the semantic gap between low-level system actions and natural
+language instructions.
+2) Fine-grained tracing and side-channel detection:
+Extend the observation scope to memory-mapped
+I/O, io_uring, pipes, Unix-domain sockets, sharedmemory IPC, and network endpoints, and introduce
+heuristic anomaly detection methods targeting timingrelated system calls to mitigate the risk of side-channel
+data exfiltration. Meanwhile, refine the provenance propagation logic for file I/O to improve the precision of
+inferred data-flow directions.
+3) Active intervention and defense mechanisms: Investigate the feasibility of extending the framework with
+active policy enforcement. Explore active enforcement
+through BPF LSM hooks or integration with Linux
+security mechanisms such as seccomp, enabling policy-
+
+based denial or termination when a prohibited provenance transition is detected.
+4) Component-Level Performance Profiling: The current
+evaluation reports aggregate end-to-end latency and system CPU consumption. Table II identifies the architectural cost centers but does not quantify their individual contributions. Future work will separately measure
+per-hook execution, state-helper operations, ring-buffer
+delivery, and user-space reconstruction.
+VII. C ONCLUSION
+This paper presents Agent-Warden, a kernel-level provenance tracking framework designed to address observability
+gaps in the process and file interactions of LLM agents.
+The four-rule state-transition model enables Agent-Warden
+to capture event-level process creation, file-interaction behavior, and asynchronous execution paths. Exit-triggered causal
+aggregation preserves conservative causal context for shortlived child processes whose execution may extend beyond the
+application-layer trace boundary.
+In terms of engineering implementation, Agent-Warden provides two interchangeable tracking engines. Warden-Hash supports compatible kernels lacking BPF local-storage features,
+while Warden-Local couples provenance-state management to
+task and inode lifetimes and reduces reliance on PID-keyed
+global maps. Experiments on x86-64 and ARM64 bare-metal
+platforms show that Agent-Warden reconstructs the expected
+causal chain in the evaluated scenario while incurring 0.2–
+3.5% end-to-end overhead and 0.6–3.7% additional system
+CPU time. Together, the functional and performance results
+support the feasibility of kernel-level process–file provenance
+tracking for LLM agents within the evaluated workloads.
+AI D ISCLOSURE
+We used OpenAI Codex, DeepSeek, and Google Gemini
+to assist with English-language editing, manuscript organization, and consistency-oriented revision. The tools materially
+affected the Abstract and Sections I, II, IV, V, VI, and VII. The
+authors verified the correctness and originality of all content
+including references.
+R EFERENCES
+[1] L. Wang, C. Ma, X. Feng, Z. Zhang, H. Yang, J. Zhang, Z. Chen,
+J. Tang, X. Chen, Y. Lin, W. X. Zhao, Z. Wei, and J. Wen, “A survey on
+large language model based autonomous agents,” Frontiers of Computer
+Science, vol. 18, no. 6, p. 186345, 2024.
+[2] K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, and M. Fritz,
+“Not What You’ve Signed Up For: Compromising Real-World LLMIntegrated Applications with Indirect Prompt Injection,” in Proceedings
+of the 16th ACM Workshop on Artificial Intelligence and Security (AISec
+’23), Nov. 2023, pp. 79–90.
+[3] R. Fang, R. Bindu, A. Gupta, Q. Zhan, and D. Kang, “LLM agents can
+autonomously hack websites,” arXiv preprint arXiv:2402.06664, 2024.
+[Online]. Available: https://arxiv.org/abs/2402.06664
+[4] M. Lupinacci, F. A. Pironti, F. Blefari, F. Romeo, L. Arena, and
+A. Furfaro, “The Dark Side of LLMs: Agent-based attack vectors
+for system-level compromise,” arXiv preprint arXiv:2507.06850, 2025.
+[Online]. Available: https://arxiv.org/abs/2507.06850
+
+[5] H. Zhang, J. Huang, K. Mei, Y. Yao, Z. Wang, C. Zhan, H. Wang, and
+Y. Zhang, “Agent security bench (asb): Formalizing and benchmarking
+attacks and defenses in LLM-based agents,” in Proceedings of the 13th
+International Conference on Learning Representations (ICLR), 2025.
+[6] Langfuse, “Langfuse: Open source llm engineering platform,”
+https://github.com/langfuse/langfuse, 2024, accessed: July 2026.
+[7] Y. Zheng, Y. Hu, T. Yu, and A. Quinn, “Agentsight: System-level
+observability for AI agents using eBPF,” in Proceedings of the 4th
+Workshop on Practical Adoption Challenges of ML for Systems (PACMI
+’25), 2025, pp. 110–115.
+[8] Linux
+Kernel
+Contributors,
+“BPF
+documentation,”
+https://docs.kernel.org/bpf/, 2026, accessed: August 2026.
+[9] B. Gregg, BPF Performance Tools: Linux System and Application
+Observability. Addison-Wesley Professional, Dec. 2019.
+[10] H. Sun and Z. Su, “Validating the eBPF verifier via state embedding,”
+in Proceedings of the 18th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI), 2024, pp. 643–662.
+[11] OWASP Foundation, “OWASP Top 10 for Large Language Model
+Applications 2025,” OWASP Foundation, Tech. Rep. Version 1.0,
+2025, [Online]. Available: https://owasp.org/www-project-top-10-forlarge-language-model-applications/. Accessed: Jun. 27, 2026.
+[12] C. Bühler, M. Biagiola, L. Di Grazia, and G. Salvaneschi, “AgentBound:
+Securing execution boundaries of AI agents,” in Proceedings of the 34th
+ACM Joint European Software Engineering Conference and Symposium
+on the Foundations of Software Engineering (ESEC/FSE). New York,
+NY, USA: ACM, Jul. 2026.
+[13] H. Wang, C. M. Poskitt, and J. Sun, “Agentspec: Customizable runtime
+enforcement for safe and reliable LLM agents,” in Proceedings of
+the 48th IEEE/ACM International Conference on Software Engineering
+(ICSE).
+Rio de Janeiro, Brazil: ACM, April 2026, accepted for
+publication. arXiv:2503.18666.
+[14] S. T. King and P. M. Chen, “Backtracking intrusions,” in Proceedings
+of the 19th ACM Symposium on Operating Systems Principles (SOSP),
+2003, pp. 223–236.
+[15] S. Ma, X. Zhang, and D. Xu, “ProTracer: Towards practical provenance
+tracing by alternating between logging and tainting,” in Proceedings of
+the Network and Distributed System Security Symposium (NDSS), 2016.
+[16] R. Sekar, H. Kimm, and R. Aich, “eAudit: A fast, scalable and
+deployable audit data collection system,” in Proceedings of the IEEE
+Symposium on Security and Privacy (S&P), 2024, pp. 3571–3589.
+[17] B. Zhang, Y. Gao, C. Yu, B. Kuang, Z. Zhang, H. Kim, and A. Fu,
+“TAPAS: An efficient online APT detection with task-guided process
+provenance graph segmentation and analysis,” in Proceedings of the
+34th USENIX Security Symposium (USENIX Security).
+USENIX
+Association, 2025, pp. 607–624.
+[18] S. Ma, J. Zhai, F. Wang, K. H. Lee, X. Zhang, and D. Xu, “MPI:
+Multiple perspective attack investigation with semantic aware execution
+partitioning,” in Proceedings of the 26th USENIX Security Symposium
+(USENIX Security), 2017, pp. 1111–1128.
+[19] Z. Li, Q. Chen, W. Yang, Y. Chen, and W. Ruan, “Threat detection
+and investigation with system-level provenance graphs: A survey,”
+Computers & Security, vol. 106, p. 102282, 2021.
+[20] Y. He, R. Guo, Y. Xing, X. Che, K. Sun, Z. Liu, K. Xu, and Q. Li, “Cross
+container attacks: The bewildered eBPF on clouds,” in Proceedings of
+the 32nd USENIX Security Symposium (USENIX Security), 2023, pp.
+5971–5988.
+[21] P. E. McKenney, A. Arcangeli, A. Kleen, D. Sarma, O. Krieger, and
+R. Russell, “Read copy update,” in Proceedings of the Ottawa Linux
+Symposium (OLS), 2002, pp. 338–367.
+[22] W. Enck, P. Gilbert, B.-G. Chun, L. P. Cox, J. Jung, P. McDaniel,
+and A. N. Sheth, “TaintDroid: An information-flow tracking system for
+realtime privacy monitoring on smartphones,” in Proceedings of the 9th
+USENIX Symposium on Operating Systems Design and Implementation
+(OSDI), 2010, pp. 393–407.
+[23] Langfuse,
+“Observability
+and
+application
+tracing,”
+https://langfuse.com/docs/observability/overview,
+2026,
+accessed:
+August 2026.
+[24] ——,
+“Trace
+IDs
+and
+distributed
+tracing,”
+https://langfuse.com/docs/observability/features/trace-ids-anddistributed-tracing, 2026, accessed: August 2026.
+
+

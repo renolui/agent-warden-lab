@@ -1,0 +1,48 @@
+digraph AgentProvenance {
+    rankdir=LR;
+    fontname="Helvetica,Arial,sans-serif";
+    node [fontname="Helvetica,Arial,sans-serif", fontsize=10, style="filled,rounded"];
+    edge [fontname="Helvetica,Arial,sans-serif", fontsize=9, arrowsize=0.8];
+
+    // Entities (Nodes)
+    "proc_11144" [label="python3\n(PID: 11144)", shape=box, fillcolor="#FFCDD2", color="#B71C1C", penwidth=2.0];
+    "file_ino_3165581" [label="sensitive_credentials.env\n(ino:3165581)", shape=note, fillcolor="#FFE0B2", color="#E65100", penwidth=1.5];
+    "file_ino_3165585" [label="malicious_cron.sh\n(ino:3165585)", shape=note, fillcolor="#FFE0B2", color="#E65100", penwidth=1.5];
+    "proc_11162" [label="python3\n(PID: 11162)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11162_exec" [label="/bin/bash\n(PID: 11162)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11163" [label="bash\n(PID: 11163)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11163_exec" [label="/usr/bin/sleep\n(PID: 11163)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11129" [label="Parent\n(PID: 11129)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11164" [label="bash\n(PID: 11164)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11164_exec" [label="/usr/bin/mv\n(PID: 11164)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "rename_/tmp/agent_warden_test/malicious_worker.sh" [label="/tmp/agent_warden_test/malicious_worker.sh\n(Renamed)", shape=note, fillcolor="#FFE0B2", color="#E65100", penwidth=1.5];
+    "rename_/tmp/agent_warden_test/malicious_cron.sh" [label="/tmp/agent_warden_test/malicious_cron.sh\n(Original)", shape=note, fillcolor="#FFE0B2", color="#E65100", penwidth=1.5];
+    "proc_11165" [label="bash\n(PID: 11165)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11165_exec" [label="/usr/bin/cat\n(PID: 11165)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11166" [label="bash\n(PID: 11166)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_11166_exec" [label="/usr/bin/python3\n(PID: 11166)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+    "proc_1" [label="Parent\n(PID: 1)", shape=box, fillcolor="#BBDEFB", color="#0D47A1", penwidth=1.5];
+
+    // Causal Flow Transitions (Edges)
+    "proc_11144" -> "file_ino_3165581" [label=" Write (56 B) ", color="#FB8C00", fontcolor="#FB8C00", style="solid", penwidth=1.5];
+    "proc_11144" -> "file_ino_3165585" [label=" Write (1029 B) ", color="#FB8C00", fontcolor="#FB8C00", style="solid", penwidth=1.5];
+    "proc_11144" -> "proc_11162" [label=" Fork ", color="#1E88E5", fontcolor="#1E88E5", style="solid", penwidth=1.5];
+    "proc_11162" -> "proc_11162_exec" [label=" Exec ", color="#00ACC1", fontcolor="#00ACC1", style="solid", penwidth=1.5];
+    "file_ino_3165585" -> "proc_11162" [label=" Read (Propagate) ", color="#D81B60", fontcolor="#D81B60", style="solid", penwidth=1.5];
+    "proc_11162" -> "proc_11163" [label=" Fork ", color="#1E88E5", fontcolor="#1E88E5", style="solid", penwidth=1.5];
+    "proc_11163" -> "proc_11163_exec" [label=" Exec ", color="#00ACC1", fontcolor="#00ACC1", style="solid", penwidth=1.5];
+    "proc_11144" -> "proc_11129" [label=" Exit Aggregation ", color="#43A047", fontcolor="#43A047", style="dashed", penwidth=1.5];
+    "proc_11163" -> "proc_11162" [label=" Exit Aggregation ", color="#43A047", fontcolor="#43A047", style="dashed", penwidth=1.5];
+    "proc_11162" -> "proc_11164" [label=" Fork ", color="#1E88E5", fontcolor="#1E88E5", style="solid", penwidth=1.5];
+    "proc_11164" -> "proc_11164_exec" [label=" Exec ", color="#00ACC1", fontcolor="#00ACC1", style="solid", penwidth=1.5];
+    "rename_/tmp/agent_warden_test/malicious_cron.sh" -> "rename_/tmp/agent_warden_test/malicious_worker.sh" [label=" Rename ", color="#8E24AA", fontcolor="#8E24AA", style="dashed", penwidth=1.5];
+    "proc_11164" -> "proc_11162" [label=" Exit Aggregation ", color="#43A047", fontcolor="#43A047", style="dashed", penwidth=1.5];
+    "proc_11162" -> "proc_11165" [label=" Fork ", color="#1E88E5", fontcolor="#1E88E5", style="solid", penwidth=1.5];
+    "proc_11165" -> "proc_11165_exec" [label=" Exec ", color="#00ACC1", fontcolor="#00ACC1", style="solid", penwidth=1.5];
+    "file_ino_3165581" -> "proc_11165" [label=" Read (Propagate) ", color="#D81B60", fontcolor="#D81B60", style="solid", penwidth=1.5];
+    "proc_11165" -> "proc_11162" [label=" Exit Aggregation ", color="#43A047", fontcolor="#43A047", style="dashed", penwidth=1.5];
+    "proc_11162" -> "proc_11166" [label=" Fork ", color="#1E88E5", fontcolor="#1E88E5", style="solid", penwidth=1.5];
+    "proc_11166" -> "proc_11166_exec" [label=" Exec ", color="#00ACC1", fontcolor="#00ACC1", style="solid", penwidth=1.5];
+    "proc_11166" -> "proc_11162" [label=" Exit Aggregation ", color="#43A047", fontcolor="#43A047", style="dashed", penwidth=1.5];
+    "proc_11162" -> "proc_1" [label=" Exit Aggregation ", color="#43A047", fontcolor="#43A047", style="dashed", penwidth=1.5];
+}

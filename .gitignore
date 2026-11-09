@@ -1,0 +1,22 @@
+# Binaries and build artifacts
+collector/agent-warden
+ebpf/warden.bpf.o
+ebpf/warden.skel.h
+*.o
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Temporary and benchmark files
+/tmp/agent_warden_*
+*.tmp
+*.dat
+*.swp
+*~
+.DS_Store
+
